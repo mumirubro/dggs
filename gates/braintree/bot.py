@@ -5,7 +5,7 @@ import time
 import html
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
-from main import BraintreeAutomatedChecker
+from gates.braintree.main import BraintreeAutomatedChecker
 import json
 import re
 import requests
