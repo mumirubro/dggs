@@ -116,6 +116,10 @@ def shopify_api():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+@app.route('/')
+def health_check():
+    return jsonify({"status": "healthy", "bot": "active"}), 200
+
 def run_flask():
     app.run(host='0.0.0.0', port=5000)
 
